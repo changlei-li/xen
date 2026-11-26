@@ -35,11 +35,14 @@
 int log_reload = 0;
 int log_guest = 0;
 int log_hv = 0;
+int syslog_guest = 0;
+int syslog_hv = 0;
 int log_time_hv = 0;
 int log_time_guest = 0;
 char *log_dir = NULL;
 int discard_overflowed_data = 1;
 int replace_escape = 0;
+int syslog_option = LOG_CONS;
 
 static void handle_hup(int sig)
 {
@@ -48,8 +51,9 @@ static void handle_hup(int sig)
 
 static void usage(char *name)
 {
-	printf("Usage: %s [-h] [-V] [-v] [-i] [--log=none|guest|hv|all] [--log-dir=DIR] [--pid-file=PATH] [-t, --timestamp=none|guest|hv|all] [-o, --overflow-data=discard|keep] [--replace-escape]\n", name);
+	printf("Usage: %s [-h] [-V] [-v] [-i] [--log=none|guest|hv|all] [--log-dir=DIR] [--pid-file=PATH] [-t, --timestamp=none|guest|hv|all] [-o, --overflow-data=discard|keep] [--replace-escape] [--syslog=none|guest|hv|all]\n", name);
 	printf("  --replace-escape  - replace ESC character with dot when writing console log\n");
+	printf("  --syslog          - send console output to syslog (independent of --log)\n");
 }
 
 static void version(char *name)
@@ -106,11 +110,11 @@ int main(int argc, char **argv)
 		{ "timestamp", 1, 0, 't' },
 		{ "overflow-data", 1, 0, 'o'},
 		{ "replace-escape", 0, 0, 'e'},
+		{ "syslog", 1, 0, 'S'},
 		{ 0 },
 	};
 	bool is_interactive = false;
 	int ch;
-	int syslog_option = LOG_CONS;
 	int syslog_mask = LOG_MASK(LOG_WARNING)|LOG_MASK(LOG_ERR)|LOG_MASK(LOG_CRIT)|\
 		          LOG_MASK(LOG_ALERT)|LOG_MASK(LOG_EMERG);
 	int opt_ind = 0;
@@ -172,6 +176,24 @@ int main(int argc, char **argv)
 			break;
 		case 'e':
 			replace_escape = 1;
+			break;
+		case 'S':
+			if (!strcmp(optarg, "all")) {
+				syslog_hv = 1;
+				syslog_guest = 1;
+			} else if (!strcmp(optarg, "hv")) {
+				syslog_hv = 1;
+			} else if (!strcmp(optarg, "guest")) {
+				syslog_guest = 1;
+			} else if (!strcmp(optarg, "none")) {
+				syslog_hv = 0;
+				syslog_guest = 0;
+			} else {
+				fprintf(stderr, "Invalid --syslog value '%s'\n",
+					optarg);
+				usage(argv[0]);
+				exit(EINVAL);
+			}
 			break;
 		case '?':
 			fprintf(stderr,

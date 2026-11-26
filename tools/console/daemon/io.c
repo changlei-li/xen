@@ -63,15 +63,28 @@
 extern int log_reload;
 extern int log_guest;
 extern int log_hv;
+extern int syslog_guest;
+extern int syslog_hv;
 extern int log_time_hv;
 extern int log_time_guest;
 extern char *log_dir;
 extern int discard_overflowed_data;
 extern int replace_escape;
+extern int syslog_option;
 
 static int log_time_hv_needts = 1;
 static int log_time_guest_needts = 1;
 static int log_hv_fd = -1;
+
+struct syslog_line {
+	/* glibc keeps the whole ident; musl keeps at most 31 bytes. */
+	char ident[128];
+	size_t len;
+	/* No limit in glibc; fits musl's 1024-byte buffer with the header. */
+	char data[960];
+};
+
+static struct syslog_line hv_syslog = { .ident = "hypervisor" };
 
 static xengnttab_handle *xgt_handle = NULL;
 static xenforeignmemory_handle *xfm_handle;
@@ -94,6 +107,7 @@ struct console {
 	int master_pollfd_idx;
 	int slave_fd;
 	int log_fd;
+	struct syslog_line *syslog;
 	struct buffer buffer;
 	char *xspath;
 	const char *log_suffix;
@@ -296,6 +310,53 @@ static int write_with_timestamp(int fd, const char *data, size_t sz,
 	return 0;
 }
 
+static void syslog_line_flush(struct syslog_line *line)
+{
+	int mask;
+
+	/* Guest consoles usually end lines with "\r\n". */
+	while (line->len && line->data[line->len - 1] == '\r')
+		line->len--;
+	if (!line->len)
+		return;
+
+	/*
+	 * Own tag, no flags and own mask, restored afterwards; safe as we are
+	 * single-threaded. No LOG_CONS/LOG_PERROR: the line must not loop
+	 * back into the console ring or be duplicated on stderr.
+	 */
+	mask = setlogmask(LOG_MASK(LOG_INFO));
+	openlog(line->ident, 0, LOG_DAEMON);
+	syslog(LOG_INFO, "%.*s", (int)line->len, line->data);
+	openlog("xenconsoled", syslog_option, LOG_DAEMON);
+	setlogmask(mask);
+	line->len = 0;
+}
+
+static void syslog_line_write(struct syslog_line *line, const char *data,
+			      size_t sz)
+{
+	size_t i;
+
+	for (i = 0; i < sz; i++) {
+		char c = data[i];
+
+		if (c == '\n') {
+			syslog_line_flush(line);
+			continue;
+		}
+		/* Strip \r after a newline, like write_with_timestamp(). */
+		if (c == '\r' && !line->len)
+			continue;
+		if (c == '\033' && replace_escape)
+			c = '.';
+
+		line->data[line->len++] = c;
+		if (line->len == sizeof(line->data))
+			syslog_line_flush(line);
+	}
+}
+
 static inline bool buffer_available(struct console *con)
 {
 	if (discard_overflowed_data ||
@@ -360,6 +421,10 @@ static void buffer_append(struct console *con)
 			      "on domain %d: %d (%s)\n",
 			      dom->domid, errno, strerror(errno));
 	}
+
+	if (con->syslog)
+		syslog_line_write(con->syslog,
+				  buffer->data + buffer->size - size, size);
 
 	if (discard_overflowed_data && buffer->max_capacity &&
 	    buffer->size > 5 * buffer->max_capacity / 4) {
@@ -433,30 +498,37 @@ static int create_hv_log(void)
 	return fd;
 }
 
-static int create_console_log(struct console *con)
+static char *read_domain_name(struct domain *dom)
 {
-	char logfile[PATH_MAX];
 	char *namepath, *data, *s;
-	int fd;
 	unsigned int len;
-	struct domain *dom = con->d;
 
 	namepath = xs_get_domain_path(xs, dom->domid);
 	s = realloc(namepath, strlen(namepath) + 6);
 	if (s == NULL) {
 		free(namepath);
-		return -1;
+		return NULL;
 	}
 	namepath = s;
 	strcat(namepath, "/name");
 	data = xs_read(xs, XBT_NULL, namepath, &len);
 	free(namepath);
+	if (data && !len) {
+		free(data);
+		return NULL;
+	}
+	return data;
+}
+
+static int create_console_log(struct console *con)
+{
+	char logfile[PATH_MAX];
+	char *data;
+	int fd;
+
+	data = read_domain_name(con->d);
 	if (!data)
 		return -1;
-	if (!len) {
-		free(data);
-		return -1;
-	}
 
 	snprintf(logfile, PATH_MAX-1, "%s/guest-%s%s.log",
 		 log_dir, data, con->log_suffix);
@@ -480,6 +552,45 @@ static int create_console_log(struct console *con)
 		}
 	}
 	return fd;
+}
+
+static struct syslog_line *create_console_syslog(struct console *con)
+{
+	struct syslog_line *line;
+	char *name, *p;
+	size_t len, name_max;
+
+	name = read_domain_name(con->d);
+	if (!name)
+		return NULL;
+
+	line = calloc(1, sizeof(*line));
+	if (line == NULL) {
+		dolog(LOG_ERR, "Memory allocation failed");
+		exit(ENOMEM);
+	}
+
+	/* Keep the suffix and whole UTF-8 characters if the name is cut. */
+	name_max = sizeof(line->ident) - strlen("guest-") -
+		   strlen(con->log_suffix) - 1;
+	len = strlen(name);
+	if (len > name_max) {
+		len = name_max;
+		while (len && ((unsigned char)name[len] & 0xc0) == 0x80)
+			len--;
+	}
+	snprintf(line->ident, sizeof(line->ident), "guest-%.*s%s",
+		 (int)len, name, con->log_suffix);
+	free(name);
+
+	/* Replace ASCII that could break tag parsing; keep UTF-8 bytes. */
+	for (p = line->ident; *p; p++)
+		if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+		      (*p >= '0' && *p <= '9') || *p == '.' || *p == '_' ||
+		      *p == '-' || (unsigned char)*p >= 0x80))
+			*p = '_';
+
+	return line;
 }
 
 static void console_close_tty(struct console *con)
@@ -780,6 +891,9 @@ static int console_create_ring(struct console *con)
 	if (log_guest && (con->log_fd == -1))
 		con->log_fd = create_console_log(con);
 
+	if (syslog_guest && !con->syslog)
+		con->syslog = create_console_syslog(con);
+
  out:
 	/* Mark the console connected. */
 	if (!err && con->interface)
@@ -827,6 +941,7 @@ static int console_init(struct console *con, struct domain *dom, void **data)
 	con->master_pollfd_idx = -1;
 	con->slave_fd = -1;
 	con->log_fd = -1;
+	con->syslog = NULL;
 	con->ring_ref = -1;
 	con->local_port = -1;
 	con->remote_port = -1;
@@ -916,11 +1031,23 @@ static void remove_domain(struct domain *dom)
 	}
 }
 
+static void console_flush_syslog(struct console *con)
+{
+	if (con->syslog)
+		syslog_line_flush(con->syslog);
+}
+
 static void console_cleanup(struct console *con)
 {
 	if (con->log_fd != -1) {
 		close(con->log_fd);
 		con->log_fd = -1;
+	}
+
+	if (con->syslog) {
+		syslog_line_flush(con->syslog);
+		free(con->syslog);
+		con->syslog = NULL;
 	}
 
 	free(con->buffer.data);
@@ -1175,22 +1302,29 @@ static void handle_hv_logs(xenevtchn_handle *xce_handle, bool force)
 
 	do
 	{
-		int logret;
-
 		size = sizeof(buffer);
 		if (xc_readconsolering(xc, bufptr, &size, 0, 1, &index) != 0 ||
 		    size == 0)
 			break;
 
-		if (log_time_hv)
-			logret = write_with_timestamp(log_hv_fd, buffer, size,
-						      &log_time_hv_needts);
-		else
-			logret = write_all(log_hv_fd, buffer, size);
+		if (syslog_hv)
+			syslog_line_write(&hv_syslog, buffer, size);
 
-		if (logret < 0)
-			dolog(LOG_ERR, "Failed to write hypervisor log: "
-				       "%d (%s)", errno, strerror(errno));
+		if (log_hv) {
+			int logret;
+
+			if (log_time_hv)
+				logret = write_with_timestamp(
+					log_hv_fd, buffer, size,
+					&log_time_hv_needts);
+			else
+				logret = write_all(log_hv_fd, buffer, size);
+
+			if (logret < 0)
+				dolog(LOG_ERR,
+				      "Failed to write hypervisor log: %d (%s)",
+				      errno, strerror(errno));
+		}
 	} while (size == sizeof(buffer));
 
 	if (port != -1)
@@ -1324,17 +1458,20 @@ void handle_io(void)
 	int xce_pollfd_idx = -1;
 	int xs_pollfd_idx = -1;
 	xenevtchn_handle *xce_handle = NULL;
+	bool read_hv = log_hv || syslog_hv;
 
-	if (log_hv) {
+	if (read_hv) {
 		xce_handle = xenevtchn_open(NULL, 0);
 		if (xce_handle == NULL) {
 			dolog(LOG_ERR, "Failed to open xce handle: %d (%s)",
 			      errno, strerror(errno));
 			goto out;
 		}
-		log_hv_fd = create_hv_log();
-		if (log_hv_fd == -1)
-			goto out;
+		if (log_hv) {
+			log_hv_fd = create_hv_log();
+			if (log_hv_fd == -1)
+				goto out;
+		}
 		log_hv_evtchn = xenevtchn_bind_virq(xce_handle, VIRQ_CON_RING);
 		if (log_hv_evtchn == -1) {
 			dolog(LOG_ERR, "Failed to bind to VIRQ_CON_RING: "
@@ -1371,7 +1508,7 @@ void handle_io(void)
 
 		xs_pollfd_idx = set_fds(xs_fileno(xs), POLLIN|POLLPRI);
 
-		if (log_hv)
+		if (read_hv)
 			xce_pollfd_idx = set_fds(xenevtchn_fd(xce_handle),
 						 POLLIN|POLLPRI);
 
@@ -1421,7 +1558,7 @@ void handle_io(void)
 			break;
 		}
 
-		if (log_hv && xce_pollfd_idx != -1) {
+		if (read_hv && xce_pollfd_idx != -1) {
 			if (fds[xce_pollfd_idx].revents & ~(POLLIN|POLLOUT|POLLPRI)) {
 				dolog(LOG_ERR,
 				      "Failure in poll xce_handle: %d (%s)",
@@ -1471,6 +1608,14 @@ void handle_io(void)
 	if (log_hv_fd != -1) {
 		close(log_hv_fd);
 		log_hv_fd = -1;
+	}
+	if (syslog_hv)
+		syslog_line_flush(&hv_syslog);
+	if (syslog_guest) {
+		struct domain *d;
+
+		for (d = dom_head; d; d = d->next)
+			console_iter_void_arg1(d, console_flush_syslog);
 	}
 	if (xce_handle != NULL) {
 		xenevtchn_close(xce_handle);

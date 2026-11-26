@@ -16,6 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
      afterwards.
 
 ### Added
+ - xenconsoled: new --syslog=none|guest|hv|all option to send console output
+   to syslog.
 
 ### Removed
  - On Arm:
